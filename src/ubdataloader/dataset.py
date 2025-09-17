@@ -1,230 +1,330 @@
 import os
+import time
+import json
+import queue
 import torch
+import duckdb
 import threading
+from dataclasses import dataclass
 from transformers import AutoTokenizer
-from typing import Optional, Tuple
-from streaming import StreamingDataset
+from typing import Optional, List, Dict, Any
+from streaming import StreamingDataset, Stream
 
 
-class TextDataset:
+@dataclass
+class TextTokenChunk:
+    chunk_state: Dict[str, Any]
+    text_chunk: List[str]
+    token_chunk: List[int]
+
+
+class TextChunkDataset:
     def __init__(
         self,
-        local_path: str,
-        batch_size: int,
-        remote_path: Optional[str] = None,
+        local_path: List[str],
+        remote_path: List[Optional[str]],
+        proportion: List[float],
+        chunk_size: int = 4096,
+        random_seed: int = 42,
     ):
         """
         "local_path": the local path of the dataset
         "remote_path": the remote path of the dataset
-        "batch_size": the batch size of the dataset
+        "chunk_size": the chunk size of the dataset
         """
+        self.local_path = local_path
+        self.remote_path = remote_path
+        self.proportion = proportion
+
+        # resume from the checkpoint
+        self.chunk_size = chunk_size
+        self.epoch = 0
+        self.sample_in_epoch = 0
+        self.random_seed = random_seed
+
+        self.stream_dataset = None
+
+        self._create_stream_dataset()
+
+    def _create_stream_dataset(self):
+        if self.stream_dataset is not None:
+            del self.stream_dataset
+
+        streams = []
+        for local_path, remote_path, proportion in zip(
+            self.local_path, self.remote_path, self.proportion
+        ):
+            streams.append(
+                Stream(
+                    remote=remote_path,
+                    local=local_path,
+                    proportion=proportion,
+                )
+            )
         self.stream_dataset = StreamingDataset(
-            local=local_path,
-            remote=remote_path,
+            streams=streams,
             shuffle=False,
-            batch_size=batch_size,
+            shuffle_seed=self.random_seed + self.epoch * 10,
+            num_canonical_nodes=1,
+            batch_size=self.chunk_size,
             replication=int(os.environ["WORLD_SIZE"]),
         )
-        self.batch_size = batch_size
 
-    def __len__(self):
-        return int(len(self.stream_dataset) // self.batch_size)
+    def load_state_dict(self, chunk_state: Dict[str, Any]):
+        self.epoch = chunk_state["epoch"]
+        self.sample_in_epoch = chunk_state["sample_in_epoch"]
 
-    def __getitem__(self, index):
-        batch_start = index * self.batch_size
-        batch_data = self.stream_dataset[batch_start : batch_start + self.batch_size]
+        assert self.chunk_size == chunk_state["chunk_size"]
+        assert self.random_seed == chunk_state["random_seed"]
+        assert self.remote_path == chunk_state["remote_path"]
+        assert self.proportion == chunk_state["proportion"]
 
-        batch_data = [f["text"] for f in batch_data]
+        self._create_stream_dataset()
+        self.stream_dataset.load_state_dict(chunk_state["streaming_dict"])
 
-        if len(batch_data) == 0:
-            return None
+    def record_state_dict(self):
+        return {
+            "streaming_dict": self.stream_dataset.state_dict(
+                self.sample_in_epoch, from_beginning=True
+            ),
+            "epoch": self.epoch,
+            "sample_in_epoch": self.sample_in_epoch,
+            "chunk_size": self.chunk_size,
+            "random_seed": self.random_seed,
+            "local_path": self.local_path,
+            "remote_path": self.remote_path,
+            "proportion": self.proportion,
+        }
 
-        return batch_data
+    def __iter__(self):
+        # the stream dataset will be re-created in the next epoch
+        # so it's infinite loop
+        chunk = []
+        state = None
+        while True:
+            for data in self.stream_dataset:
+                if state is None:
+                    state = self.record_state_dict()
+                chunk.append(data["text"])
+                self.sample_in_epoch += 1
+                if len(chunk) == self.chunk_size:
+                    yield chunk, state
+                    chunk = []
+                    state = None
+
+            # the stream dataset will be re-created in the next epoch
+            self.sample_in_epoch = 0
+            self.epoch += 1
+            self._create_stream_dataset()
 
 
 class TextTokenChunkCache:
     def __init__(
         self,
-        seq_len: int,
+        local_path: List[str],
+        remote_path: List[Optional[str]],
+        proportion: List[float],
+        seq_len_each_sample: int,
+        consumed_samples: int,
         batch_size: int,
-        text_dataset: TextDataset,
         tokenizer: AutoTokenizer,
-        preload_tokens: int,
+        cache_queue_num: int,
+        ckpt_path: str,
+        chunk_size: int,
+        add_extra_token_to_sequence: bool = True,
     ):
-        self.seq_len = seq_len
-        self.batch_size = batch_size
-        self.text_dataset = text_dataset
+        self.text_dataset = TextChunkDataset(
+            local_path=local_path,
+            remote_path=remote_path,
+            proportion=proportion,
+            chunk_size=chunk_size,
+        )
         self.tokenizer = tokenizer
-        self.text_chunk_window = {}
-        self.token_chunk_window = {}
 
-        self.preload_tokens = preload_tokens
-        self.cache_total_tokens = 0
-        self.cache_free_tokens = 0
+        self.consumed_samples = consumed_samples
 
-        self.token_thread_num = 32
-        self.sample_tokens_num = seq_len * batch_size
+        self.seq_len_each_sample = seq_len_each_sample
+        self.add_extra_token_to_sequence = add_extra_token_to_sequence
 
-        self.cache_thread = None
+        self.cache_queue_num = cache_queue_num
+        self.chunk_queue = queue.Queue()
+        self.process_chunk: TextTokenChunk = None
 
-    def clean_old_chunks(self, text_chunk_index: int):
-        old_keys = []
+        self.ckpt_file_path = ckpt_path
+        self.ckpt_db = None
 
-        for key in self.text_chunk_window:
-            if key < text_chunk_index:
-                old_keys.append(key)
+        self.batch_size = batch_size
 
-        for key in old_keys:
-            self.cache_total_tokens -= len(self.token_chunk_window[key])
-            del self.text_chunk_window[key]
-            del self.token_chunk_window[key]
+        self.cached_attention_mask = None
+        self.cached_loss_mask = None
+        self.cached_position_ids = None
 
-    def cache_chunk(self, text_chunk_index: int):
+        self.is_master = int(os.environ["RANK"]) == 0
+
+        self.token_it = 0
+        self.load_state_dict()
+
+        self.cache_thread = threading.Thread(target=self.cache_chunk, args=())
+        self.cache_thread.start()
+
+    def save_state_dict(
+        self,
+    ):
+        # only the master process will save the state dict
+        if not self.is_master:
+            return
+
+        if self.process_chunk is None:
+            self.process_chunk = self.chunk_queue.get(block=True)
+
+        if self.ckpt_db is None:
+            self.ckpt_db = duckdb.connect(self.ckpt_file_path)
+            self.ckpt_db.execute(
+                "CREATE TABLE IF NOT EXISTS state_dict (consumed_samples INTEGER PRIMARY KEY, token_it INTEGER, chunk_state JSON)"
+            )
+
+        token_it = self.token_it
+        consumed_samples = self.consumed_samples
+        chunk_state = json.dumps(self.process_chunk.chunk_state)
+
+        self.ckpt_db.execute(
+            "INSERT OR REPLACE INTO state_dict (consumed_samples, token_it, chunk_state) VALUES (?, ?, ?)",
+            [consumed_samples, token_it, chunk_state],
+        )
+        self.ckpt_db.commit()
+
+    def load_state_dict(self):
+        # if the consumed_samples is 0, it means the first iteration
+        if self.consumed_samples == 0:
+            return
+        # load from file
+        ckpt_db = duckdb.connect(self.ckpt_file_path, read_only=True)
+        consumed_samples, token_it, chunk_state = ckpt_db.execute(
+            "SELECT consumed_samples, token_it, chunk_state FROM state_dict WHERE consumed_samples = ?",
+            [self.consumed_samples],
+        ).fetchone()
+
+        chunk_state = json.loads(chunk_state)
+
+        self.consumed_samples = int(consumed_samples)
+        self.token_it = int(token_it)
+        self.text_dataset.load_state_dict(chunk_state)
+
+    def cache_chunk(self):
         # preload the chunks
-        chunk_index = text_chunk_index
-
-        while (
-            self.cache_total_tokens < self.preload_tokens
-            or self.cache_free_tokens < self.sample_tokens_num
-        ):
-            if chunk_index in self.text_chunk_window:
-                chunk_index += 1
+        dataset_iter = iter(self.text_dataset)
+        while True:
+            if self.chunk_queue.qsize() >= self.cache_queue_num:
+                time.sleep(0.01)
                 continue
 
-            text_chunk = self.text_dataset[chunk_index]
-
-            if text_chunk is None:
-                break
-
-            self.text_chunk_window[chunk_index] = text_chunk
-            self.token_chunk_window[chunk_index] = []
+            text_chunk, chunk_state = next(dataset_iter)
 
             tokens_list = self.tokenizer(text_chunk)["input_ids"]
             token_cnt = 0
+            token_chunk = []
 
             for token in tokens_list:
                 if token[-1] != self.tokenizer.eos_token_id:
                     token.append(self.tokenizer.eos_token_id)
-                self.token_chunk_window[chunk_index].extend(token)
+                token_chunk.extend(token)
                 token_cnt += len(token)
 
-            chunk_index += 1
-            self.cache_total_tokens += token_cnt
-            self.cache_free_tokens += token_cnt
+            chunk = TextTokenChunk(
+                chunk_state=chunk_state,
+                text_chunk=text_chunk,
+                token_chunk=token_chunk,
+            )
 
-    def __getitem__(self, index: Tuple[int, int]) -> Tuple[torch.LongTensor, int, int]:
-        if self.cache_thread is not None and self.cache_thread.is_alive():
-            print("token thread is still alive! maybe the cache thread is too slow!")
-            self.cache_thread.join()
-
-        # wait for the cache to be ready
-        text_chunk_index, token_chunk_index = index
-        # clear the old chunks in the window, keep the latest preload_chunk_num chunks
-        self.clean_old_chunks(text_chunk_index)
-        if (
-            text_chunk_index not in self.text_chunk_window
-            or self.cache_free_tokens < self.sample_tokens_num
-        ):
-            self.cache_chunk(text_chunk_index)
-
-        if self.cache_free_tokens < self.sample_tokens_num:
-            return None, None, None
-
-        ret_tokens = []
-        left_need_tokens = self.sample_tokens_num
-
-        # must ensure the cache free tokens is enough
-        # so we do not need to cache the chunk again
-        while len(ret_tokens) < self.sample_tokens_num:
-            tokens = self.token_chunk_window[text_chunk_index][
-                token_chunk_index : token_chunk_index + left_need_tokens
-            ]
-            tokens_cnt = len(tokens)
-            ret_tokens.extend(tokens)
-
-            token_chunk_index += tokens_cnt
-            self.cache_free_tokens -= tokens_cnt
-            left_need_tokens -= tokens_cnt
-
-            if token_chunk_index >= len(self.token_chunk_window[text_chunk_index]):
-                text_chunk_index += 1
-                token_chunk_index = 0
-
-        assert len(ret_tokens) == self.sample_tokens_num, (
-            f"len(ret_tokens): {len(ret_tokens)}, sample_tokens_num: {self.sample_tokens_num}"
-        )
-
-        # asnyc cache the next chunk
-        self.cache_thread = threading.Thread(
-            target=self.cache_chunk, args=(text_chunk_index + 1,)
-        )
-        self.cache_thread.start()
-
-        return ret_tokens, text_chunk_index, token_chunk_index
-
-
-class TokenDataset:
-    text_it: int
-    token_it: int
-
-    def __init__(
-        self,
-        local_path: str,
-        seq_len: int,
-        batch_size: int,
-        tokenizer: AutoTokenizer,
-        remote_path: Optional[str] = None,
-        preload_tokens: Optional[int] = None,
-    ):
-        """
-        NOTE: batch size is the number of global batch size, each node will have batch_size * seq_len tokens,
-        so in data parallel, each node need to chose thier own token.
-        """
-        self.seq_len = seq_len
-        self.batch_size = batch_size
-
-        self.tokenizer = tokenizer
-
-        self.local_path = local_path
-        self.remote_path = remote_path
-
-        if preload_tokens is None:
-            preload_tokens = seq_len * batch_size * 4
-
-        self.text_dataset = TextDataset(
-            local_path=local_path,
-            remote_path=remote_path,
-            batch_size=batch_size,
-        )
-
-        self.text_token_chunk_cache = TextTokenChunkCache(
-            seq_len=seq_len,
-            batch_size=batch_size,
-            text_dataset=self.text_dataset,
-            tokenizer=tokenizer,
-            preload_tokens=preload_tokens,
-        )
-
-        # set the now_text_it to the first text chunk
-        self.text_it = 0
-        self.token_it = 0
-
-    def __len__(self):
-        return len(self.text_dataset)
+            self.chunk_queue.put(chunk)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        # only support iterator mode, not support getitem mode
-        if self.text_it is None or self.token_it is None:
-            raise StopIteration
+        ret_token_ids = []
 
-        tokens, self.text_it, self.token_it = self.text_token_chunk_cache[
-            (self.text_it, self.token_it)
-        ]
+        if self.add_extra_token_to_sequence:
+            seq_len_each_sample = self.seq_len_each_sample + 1
+        else:
+            seq_len_each_sample = self.seq_len_each_sample
 
-        if tokens is None:
-            raise StopIteration
+        seq_len_each_batch = seq_len_each_sample * self.batch_size
+        left_need_tokens = seq_len_each_batch
 
-        return tokens
+        while len(ret_token_ids) < seq_len_each_batch:
+            if self.process_chunk is None:
+                self.process_chunk = self.chunk_queue.get(block=True)
+
+            token_chunk = self.process_chunk.token_chunk
+            tokens = token_chunk[self.token_it : self.token_it + left_need_tokens]
+
+            tokens_cnt = len(tokens)
+            ret_token_ids.extend(tokens)
+
+            self.token_it += tokens_cnt
+            left_need_tokens -= tokens_cnt
+
+            if self.token_it >= len(token_chunk):
+                self.process_chunk = None
+                self.token_it = 0
+
+        assert len(ret_token_ids) == seq_len_each_batch, (
+            f"len(ret_token_ids): {len(ret_token_ids)}, seq_len_each_batch: {seq_len_each_batch}"
+        )
+
+        self.consumed_samples += 1
+
+        # prepare the mask and others
+        text = torch.tensor(
+            ret_token_ids, dtype=torch.long, device=torch.device("cpu")
+        ).view(self.batch_size, -1)
+
+        ret_tokens = text[:, :-1].contiguous()
+        ret_labels = text[:, 1:].contiguous()
+
+        if self.cached_attention_mask is None:
+            self.cached_attention_mask = (
+                (
+                    torch.tril(
+                        torch.ones(
+                            self.seq_len_each_sample,
+                            self.seq_len_each_sample,
+                            device=torch.device("cpu"),
+                        )
+                    )
+                    < 0.5
+                )
+                .unsqueeze(0)
+                .repeat(self.batch_size, 1, 1)
+            )
+
+        if self.cached_loss_mask is None:
+            self.cached_loss_mask = (
+                torch.ones(
+                    self.seq_len_each_sample,
+                    dtype=torch.float,
+                    device=torch.device("cpu"),
+                )
+                .unsqueeze(0)
+                .repeat(self.batch_size, 1)
+            )
+
+        if self.cached_position_ids is None:
+            self.cached_position_ids = (
+                torch.arange(
+                    self.seq_len_each_sample,
+                    dtype=torch.long,
+                    device=torch.device("cpu"),
+                )
+                .unsqueeze(0)
+                .repeat(self.batch_size, 1)
+            )
+
+        return {
+            "tokens": ret_tokens,
+            "labels": ret_labels,
+            "attention_mask": self.cached_attention_mask,
+            "loss_mask": self.cached_loss_mask,
+            "position_ids": self.cached_position_ids,
+        }
